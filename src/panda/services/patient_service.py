@@ -40,6 +40,11 @@ class PatientService:
     def get_patient_by_id(self, patient_id: int) -> Patient | None:
         return self._patient_repository.find_by_id(patient_id)
 
+    def get_all_patients(self) -> list[Patient]:
+        """Retrieve all registered patients."""
+
+        return self._patient_repository.find_all()
+
     def get_patient_by_nhs_number(
         self,
         nhs_number: str,

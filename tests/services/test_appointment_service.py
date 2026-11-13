@@ -4,6 +4,9 @@ from unittest.mock import Mock
 import pytest
 
 from panda.database.schema_initializer import initialise_schema
+from panda.exceptions.invalid_appointment_state_error import (
+    InvalidAppointmentStateError,
+)
 from panda.models.appointment import Appointment, AppointmentStatus
 from panda.repositories.appointment_repository_protocol import (
     AppointmentRepositoryProtocol,
@@ -31,7 +34,11 @@ def create_mock_appointment_service(existing_appointments=None):
 
     patient_repository.find_by_id.return_value = object()
 
-    appointment_repository.find_by_patient_id.return_value = existing_appointments or []
+    appointment_repository.find_by_patient_id.side_effect = lambda patient_id: [
+        appointment
+        for appointment in (existing_appointments or [])
+        if appointment.patient_id == patient_id
+    ]
     appointment_repository.save.side_effect = lambda appointment: appointment
 
     service = AppointmentService(
@@ -426,6 +433,371 @@ def test_update_appointment_status_returns_none_when_not_found():
 
 
 # ---------------------------------------------------------------------
+# Invalid appointment state validation
+# ---------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "current_status",
+    [
+        AppointmentStatus.CANCELLED,
+        AppointmentStatus.ATTENDED,
+        AppointmentStatus.MISSED,
+    ],
+)
+@pytest.mark.parametrize(
+    "requested_status",
+    [
+        AppointmentStatus.SCHEDULED,
+        AppointmentStatus.CANCELLED,
+        AppointmentStatus.ATTENDED,
+        AppointmentStatus.MISSED,
+    ],
+)
+def test_update_appointment_status_rejects_terminal_state_transitions(
+    current_status,
+    requested_status,
+):
+    service, appointment_repository, _ = create_mock_appointment_service()
+
+    appointment = create_existing_appointment(
+        start_time=datetime(2026, 11, 10, 10, 0, tzinfo=UTC),
+        end_time=datetime(2026, 11, 10, 10, 30, tzinfo=UTC),
+        status=current_status,
+    )
+
+    appointment_repository.find_by_id.return_value = appointment
+
+    with pytest.raises(
+        InvalidAppointmentStateError,
+        match="Cannot change appointment status",
+    ):
+        service.update_appointment_status(
+            appointment_id=1,
+            status=requested_status,
+        )
+
+    assert appointment.status == current_status
+    appointment_repository.find_by_id.assert_called_once_with(1)
+    appointment_repository.update.assert_not_called()
+
+
+def test_update_appointment_status_allows_scheduled_to_missed():
+    service, appointment_repository, _ = create_mock_appointment_service()
+
+    appointment = create_existing_appointment(
+        start_time=datetime(2026, 11, 10, 10, 0, tzinfo=UTC),
+        end_time=datetime(2026, 11, 10, 10, 30, tzinfo=UTC),
+    )
+
+    appointment_repository.find_by_id.return_value = appointment
+    appointment_repository.update.side_effect = lambda item: item
+
+    result = service.update_appointment_status(
+        appointment_id=1,
+        status=AppointmentStatus.MISSED,
+    )
+
+    assert result is not None
+    assert result.status == AppointmentStatus.MISSED
+    appointment_repository.update.assert_called_once_with(appointment)
+
+
+# ---------------------------------------------------------------------
+# Rescheduling appointments
+# ---------------------------------------------------------------------
+
+
+def test_reschedule_appointment_successfully():
+    service, appointment_repository, _ = create_mock_appointment_service()
+
+    appointment = create_existing_appointment(
+        start_time=datetime(2026, 11, 10, 10, 0, tzinfo=UTC),
+        end_time=datetime(2026, 11, 10, 10, 30, tzinfo=UTC),
+    )
+
+    appointment_repository.find_by_id.return_value = appointment
+    appointment_repository.update.side_effect = lambda item: item
+
+    new_start_time = datetime(2026, 11, 10, 11, 0, tzinfo=UTC)
+    new_end_time = datetime(2026, 11, 10, 11, 30, tzinfo=UTC)
+
+    result = service.reschedule_appointment(
+        appointment_id=1,
+        start_time=new_start_time,
+        end_time=new_end_time,
+    )
+
+    assert result is not None
+    assert result.id == 1
+    assert result.patient_id == 1
+    assert result.start_time == new_start_time
+    assert result.end_time == new_end_time
+    assert result.status == AppointmentStatus.SCHEDULED
+
+    appointment_repository.find_by_id.assert_called_once_with(1)
+    appointment_repository.find_by_patient_id.assert_called_once_with(1)
+    appointment_repository.update.assert_called_once_with(appointment)
+
+
+def test_reschedule_appointment_returns_none_when_not_found():
+    service, appointment_repository, _ = create_mock_appointment_service()
+
+    appointment_repository.find_by_id.return_value = None
+
+    result = service.reschedule_appointment(
+        appointment_id=999,
+        start_time=datetime(2026, 11, 10, 11, 0, tzinfo=UTC),
+        end_time=datetime(2026, 11, 10, 11, 30, tzinfo=UTC),
+    )
+
+    assert result is None
+
+    appointment_repository.find_by_id.assert_called_once_with(999)
+    appointment_repository.find_by_patient_id.assert_not_called()
+    appointment_repository.update.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "status",
+    [
+        AppointmentStatus.CANCELLED,
+        AppointmentStatus.ATTENDED,
+        AppointmentStatus.MISSED,
+    ],
+)
+def test_reschedule_appointment_rejects_non_scheduled_appointment(status):
+    service, appointment_repository, _ = create_mock_appointment_service()
+
+    appointment = create_existing_appointment(
+        start_time=datetime(2026, 11, 10, 10, 0, tzinfo=UTC),
+        end_time=datetime(2026, 11, 10, 10, 30, tzinfo=UTC),
+        status=status,
+    )
+
+    appointment_repository.find_by_id.return_value = appointment
+
+    with pytest.raises(
+        InvalidAppointmentStateError,
+        match="Cannot reschedule appointment",
+    ):
+        service.reschedule_appointment(
+            appointment_id=1,
+            start_time=datetime(2026, 11, 10, 11, 0, tzinfo=UTC),
+            end_time=datetime(2026, 11, 10, 11, 30, tzinfo=UTC),
+        )
+
+    appointment_repository.find_by_id.assert_called_once_with(1)
+    appointment_repository.find_by_patient_id.assert_not_called()
+    appointment_repository.update.assert_not_called()
+
+
+def test_reschedule_appointment_rejects_overlapping_appointment():
+    existing_appointment = create_existing_appointment(
+        start_time=datetime(2026, 11, 10, 11, 0, tzinfo=UTC),
+        end_time=datetime(2026, 11, 10, 11, 30, tzinfo=UTC),
+    )
+
+    appointment = Appointment(
+        id=2,
+        patient_id=1,
+        start_time=datetime(2026, 11, 10, 10, 0, tzinfo=UTC),
+        end_time=datetime(2026, 11, 10, 10, 30, tzinfo=UTC),
+    )
+
+    service, appointment_repository, _ = create_mock_appointment_service(
+        [existing_appointment]
+    )
+
+    appointment_repository.find_by_id.return_value = appointment
+
+    with pytest.raises(
+        ValueError,
+        match="already has an appointment",
+    ):
+        service.reschedule_appointment(
+            appointment_id=2,
+            start_time=datetime(2026, 11, 10, 11, 15, tzinfo=UTC),
+            end_time=datetime(2026, 11, 10, 11, 45, tzinfo=UTC),
+        )
+
+    assert appointment.start_time == datetime(2026, 11, 10, 10, 0, tzinfo=UTC)
+    assert appointment.end_time == datetime(2026, 11, 10, 10, 30, tzinfo=UTC)
+
+    appointment_repository.update.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "status",
+    [
+        AppointmentStatus.CANCELLED,
+        AppointmentStatus.ATTENDED,
+        AppointmentStatus.MISSED,
+    ],
+)
+def test_reschedule_appointment_allows_overlap_with_non_scheduled_appointment(
+    status,
+):
+    existing_appointment = create_existing_appointment(
+        start_time=datetime(2026, 11, 10, 11, 0, tzinfo=UTC),
+        end_time=datetime(2026, 11, 10, 11, 30, tzinfo=UTC),
+        status=status,
+    )
+
+    appointment = Appointment(
+        id=2,
+        patient_id=1,
+        start_time=datetime(2026, 11, 10, 10, 0, tzinfo=UTC),
+        end_time=datetime(2026, 11, 10, 10, 30, tzinfo=UTC),
+    )
+
+    service, appointment_repository, _ = create_mock_appointment_service(
+        [existing_appointment]
+    )
+
+    appointment_repository.find_by_id.return_value = appointment
+    appointment_repository.update.side_effect = lambda item: item
+
+    result = service.reschedule_appointment(
+        appointment_id=2,
+        start_time=datetime(2026, 11, 10, 11, 15, tzinfo=UTC),
+        end_time=datetime(2026, 11, 10, 11, 45, tzinfo=UTC),
+    )
+
+    assert result is not None
+    assert result.start_time == datetime(2026, 11, 10, 11, 15, tzinfo=UTC)
+    assert result.end_time == datetime(2026, 11, 10, 11, 45, tzinfo=UTC)
+
+    appointment_repository.update.assert_called_once_with(appointment)
+
+
+def test_reschedule_appointment_allows_back_to_back_appointments():
+    existing_appointment = create_existing_appointment(
+        start_time=datetime(2026, 11, 10, 11, 0, tzinfo=UTC),
+        end_time=datetime(2026, 11, 10, 11, 30, tzinfo=UTC),
+    )
+
+    appointment = Appointment(
+        id=2,
+        patient_id=1,
+        start_time=datetime(2026, 11, 10, 10, 0, tzinfo=UTC),
+        end_time=datetime(2026, 11, 10, 10, 30, tzinfo=UTC),
+    )
+
+    service, appointment_repository, _ = create_mock_appointment_service(
+        [existing_appointment]
+    )
+
+    appointment_repository.find_by_id.return_value = appointment
+    appointment_repository.update.side_effect = lambda item: item
+
+    result = service.reschedule_appointment(
+        appointment_id=2,
+        start_time=datetime(2026, 11, 10, 10, 30, tzinfo=UTC),
+        end_time=datetime(2026, 11, 10, 11, 0, tzinfo=UTC),
+    )
+
+    assert result is not None
+    assert result.start_time == datetime(2026, 11, 10, 10, 30, tzinfo=UTC)
+
+    appointment_repository.update.assert_called_once_with(appointment)
+
+
+def test_reschedule_appointment_excludes_itself_from_overlap_check():
+    appointment = create_existing_appointment(
+        start_time=datetime(2026, 11, 10, 10, 0, tzinfo=UTC),
+        end_time=datetime(2026, 11, 10, 10, 30, tzinfo=UTC),
+    )
+
+    service, appointment_repository, _ = create_mock_appointment_service([appointment])
+
+    appointment_repository.find_by_id.return_value = appointment
+    appointment_repository.update.side_effect = lambda item: item
+
+    result = service.reschedule_appointment(
+        appointment_id=1,
+        start_time=datetime(2026, 11, 10, 10, 15, tzinfo=UTC),
+        end_time=datetime(2026, 11, 10, 10, 45, tzinfo=UTC),
+    )
+
+    assert result is not None
+    assert result.start_time == datetime(2026, 11, 10, 10, 15, tzinfo=UTC)
+    assert result.end_time == datetime(2026, 11, 10, 10, 45, tzinfo=UTC)
+
+    appointment_repository.update.assert_called_once_with(appointment)
+
+
+def test_reschedule_appointment_rejects_start_time_after_end_time():
+    service, appointment_repository, _ = create_mock_appointment_service()
+
+    appointment = create_existing_appointment(
+        start_time=datetime(2026, 11, 10, 10, 0, tzinfo=UTC),
+        end_time=datetime(2026, 11, 10, 10, 30, tzinfo=UTC),
+    )
+
+    appointment_repository.find_by_id.return_value = appointment
+
+    with pytest.raises(
+        ValueError,
+        match="Appointment start time must be before end time",
+    ):
+        service.reschedule_appointment(
+            appointment_id=1,
+            start_time=datetime(2026, 11, 10, 12, 0, tzinfo=UTC),
+            end_time=datetime(2026, 11, 10, 11, 0, tzinfo=UTC),
+        )
+
+    appointment_repository.find_by_patient_id.assert_not_called()
+    appointment_repository.update.assert_not_called()
+
+
+def test_reschedule_appointment_rejects_timezone_naive_start_time():
+    service, appointment_repository, _ = create_mock_appointment_service()
+
+    appointment = create_existing_appointment(
+        start_time=datetime(2026, 11, 10, 10, 0, tzinfo=UTC),
+        end_time=datetime(2026, 11, 10, 10, 30, tzinfo=UTC),
+    )
+
+    appointment_repository.find_by_id.return_value = appointment
+
+    with pytest.raises(
+        ValueError,
+        match="Appointment start time must be timezone-aware",
+    ):
+        service.reschedule_appointment(
+            appointment_id=1,
+            start_time=datetime(2026, 11, 10, 11, 0),
+            end_time=datetime(2026, 11, 10, 11, 30, tzinfo=UTC),
+        )
+
+    appointment_repository.update.assert_not_called()
+
+
+def test_reschedule_appointment_rejects_timezone_naive_end_time():
+    service, appointment_repository, _ = create_mock_appointment_service()
+
+    appointment = create_existing_appointment(
+        start_time=datetime(2026, 11, 10, 10, 0, tzinfo=UTC),
+        end_time=datetime(2026, 11, 10, 10, 30, tzinfo=UTC),
+    )
+
+    appointment_repository.find_by_id.return_value = appointment
+
+    with pytest.raises(
+        ValueError,
+        match="Appointment end time must be timezone-aware",
+    ):
+        service.reschedule_appointment(
+            appointment_id=1,
+            start_time=datetime(2026, 11, 10, 11, 0, tzinfo=UTC),
+            end_time=datetime(2026, 11, 10, 11, 30),
+        )
+
+    appointment_repository.update.assert_not_called()
+
+
+# ---------------------------------------------------------------------
 # Cancelling appointments
 # ---------------------------------------------------------------------
 
@@ -464,7 +836,7 @@ def test_cancel_appointment_returns_none_when_not_found():
 
 
 # ---------------------------------------------------------------------
-# SQLite appointment status and cancellation integration
+# SQLite appointment status, cancellation and rescheduling integration
 # ---------------------------------------------------------------------
 
 
@@ -512,3 +884,81 @@ def test_cancel_appointment_with_sqlite(sqlite_appointment_service):
     retrieved_appointment = appointment_service.get_appointment_by_id(appointment.id)
 
     assert retrieved_appointment.status == AppointmentStatus.CANCELLED
+
+
+def test_reschedule_appointment_with_sqlite(sqlite_appointment_service):
+    appointment_service, patient_repository = sqlite_appointment_service
+
+    patient = create_test_patient(patient_repository)
+
+    appointment = appointment_service.book_appointment(
+        patient_id=patient.id,
+        start_time=datetime(2026, 11, 10, 10, 0, tzinfo=UTC),
+        end_time=datetime(2026, 11, 10, 10, 30, tzinfo=UTC),
+    )
+
+    new_start_time = datetime(2026, 11, 10, 11, 0, tzinfo=UTC)
+    new_end_time = datetime(2026, 11, 10, 11, 30, tzinfo=UTC)
+
+    rescheduled_appointment = appointment_service.reschedule_appointment(
+        appointment_id=appointment.id,
+        start_time=new_start_time,
+        end_time=new_end_time,
+    )
+
+    assert rescheduled_appointment is not None
+    assert rescheduled_appointment.id == appointment.id
+    assert rescheduled_appointment.start_time == new_start_time
+    assert rescheduled_appointment.end_time == new_end_time
+    assert rescheduled_appointment.status == AppointmentStatus.SCHEDULED
+
+    retrieved_appointment = appointment_service.get_appointment_by_id(appointment.id)
+
+    assert retrieved_appointment is not None
+    assert retrieved_appointment.start_time == new_start_time
+    assert retrieved_appointment.end_time == new_end_time
+
+
+# ---------------------------------------------------------------------
+# Additional booking validation
+# ---------------------------------------------------------------------
+
+
+def test_book_appointment_rejects_invalid_patient_id():
+    service, appointment_repository, _ = create_mock_appointment_service()
+
+    with pytest.raises(
+        ValueError,
+        match="Patient ID must be positive",
+    ):
+        service.book_appointment(
+            patient_id=0,
+            start_time=datetime(2026, 11, 10, 10, 0, tzinfo=UTC),
+            end_time=datetime(2026, 11, 10, 10, 30, tzinfo=UTC),
+        )
+
+    appointment_repository.save.assert_not_called()
+
+
+def test_book_appointment_allows_overlap_for_different_patients():
+    existing_appointment = Appointment(
+        id=1,
+        patient_id=1,
+        start_time=datetime(2026, 11, 10, 10, 0, tzinfo=UTC),
+        end_time=datetime(2026, 11, 10, 10, 30, tzinfo=UTC),
+    )
+
+    service, appointment_repository, patient_repository = (
+        create_mock_appointment_service([existing_appointment])
+    )
+
+    appointment = service.book_appointment(
+        patient_id=2,
+        start_time=datetime(2026, 11, 10, 10, 15, tzinfo=UTC),
+        end_time=datetime(2026, 11, 10, 10, 45, tzinfo=UTC),
+    )
+
+    assert appointment.patient_id == 2
+    appointment_repository.find_by_patient_id.assert_called_once_with(2)
+    appointment_repository.save.assert_called_once()
+    patient_repository.find_by_id.assert_called_once_with(2)

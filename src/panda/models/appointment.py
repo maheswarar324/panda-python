@@ -18,9 +18,12 @@ class Appointment:
     id: int | None = None
     status: AppointmentStatus = AppointmentStatus.SCHEDULED
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         if self.patient_id <= 0:
             raise ValueError("Patient ID must be positive")
+
+        if not isinstance(self.status, AppointmentStatus):
+            raise TypeError("Invalid appointment status")
 
         if self.start_time.tzinfo is None or self.start_time.utcoffset() is None:
             raise ValueError("Appointment start time must be timezone-aware")
